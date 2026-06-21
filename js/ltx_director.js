@@ -2017,12 +2017,29 @@ class TimelineEditor {
   }
 
 
+  _hydrateImageFromFile(seg) {
+    // Externally-authored timelines (e.g. the storyboard skill) reference images
+    // by server path only, with no embedded imageB64 — so resolve imageFile to a
+    // /view URL and build the preview. Mirrors the "Replace with..." upload path.
+    const parts = (seg.imageFile || "").split(/[/\\]/);
+    const justName = parts.pop() || "";
+    if (!justName) return;
+    const subfolder = parts.join("/");
+    const imgUrl = api.apiURL(`/view?filename=${encodeURIComponent(justName)}&type=input&subfolder=${encodeURIComponent(subfolder)}`);
+    seg.imageB64 = imgUrl;
+    seg.imgObj = new Image();
+    seg.imgObj.onload = () => { if (!this._isDragging) this.render(); };
+    seg.imgObj.src = imgUrl;
+  }
+
   loadMedia() {
     for (const seg of this.timeline.segments) {
       if (seg.imageB64 && !seg.imgObj) {
         seg.imgObj = new Image();
         seg.imgObj.onload = () => { if (!this._isDragging) this.render(); };
         seg.imgObj.src = seg.imageB64;
+      } else if (seg.type === "image" && seg.imageFile && !seg.imgObj) {
+        this._hydrateImageFromFile(seg);
       }
       if (seg.type === "video") {
         this._ensureVideoEl(seg);
@@ -2037,6 +2054,8 @@ class TimelineEditor {
           seg.imgObj = new Image();
           seg.imgObj.onload = () => { if (!this._isDragging) this.render(); };
           seg.imgObj.src = seg.imageB64;
+        } else if (seg.isStaticRef && seg.imageFile && !seg.imgObj) {
+          this._hydrateImageFromFile(seg);
         }
         if (seg.type === "motion_video") {
           this._ensureVideoEl(seg);
