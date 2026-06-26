@@ -9,6 +9,10 @@ const MOTION_TRACK_HEIGHT = 80; // used as Motion Guide track height
 const CANVAS_HEIGHT = RULER_HEIGHT + BLOCK_HEIGHT + MOTION_TRACK_HEIGHT + AUDIO_TRACK_HEIGHT;
 const HANDLE_HIT_PX = 14;
 const MIN_SEGMENT_LENGTH = 6;
+// §1.1 retake two-zone split: the main band [RULER_HEIGHT, RULER_HEIGHT+blockHeight]
+// is divided into a CHROME ZONE (top, window border/handles/label) and a CARD ZONE
+// (bottom, keyframe beats). RETAKE_CHROME_FRAC is the chrome zone's share of the band.
+const RETAKE_CHROME_FRAC = 0.45;
 const MAX_THUMBNAIL_DIM = 512; // Increased to maintain quality for taller images
 
 const HIDDEN_WIDGET_NAMES = ["timeline_data", "local_prompts", "segment_lengths", "guide_strength", "audio_data", "use_custom_audio", "inpaint_audio", "use_custom_motion", "override_audio"];
@@ -689,8 +693,10 @@ function parseInitial(jsonStr) {
       if (p.overrideAudio !== undefined) parsed.overrideAudio = p.overrideAudio;
       if (p.inpaint_audio !== undefined) parsed.inpaint_audio = p.inpaint_audio;
       if (p.retakeMode !== undefined) parsed.retakeMode = p.retakeMode;
-      if (p.retakeStart !== undefined) parsed.retakeStart = p.retakeStart;
-      if (p.retakeLength !== undefined) parsed.retakeLength = p.retakeLength;
+      // L1 (Invariant #9): round retake geometry at the DESERIALIZE entry boundary so a
+      // saved/hand-edited workflow with fractional frames can never feed the tiling.
+      if (p.retakeStart !== undefined) parsed.retakeStart = Math.round(p.retakeStart);
+      if (p.retakeLength !== undefined) parsed.retakeLength = Math.round(p.retakeLength);
       if (p.retakePrompt !== undefined) parsed.retakePrompt = p.retakePrompt;
       if (p.retakeStrength !== undefined) parsed.retakeStrength = p.retakeStrength;
       if (p.retakeVideo !== undefined) parsed.retakeVideo = p.retakeVideo;
@@ -699,6 +705,9 @@ function parseInitial(jsonStr) {
       if (Array.isArray(p.segments)) {
         parsed.segments = p.segments.map(s => {
           const { imgObj, videoEl, _isSeeking, thumbnails, _extractingThumbs, _sSecs, _lSecs, _tSecs, _dSecs, _uploading, _blobUrl, ...rest } = s;
+          // L1: round segment frame positions at deserialize (pixel frames are integers).
+          if (rest.start !== undefined) rest.start = Math.round(rest.start);
+          if (rest.length !== undefined) rest.length = Math.round(rest.length);
           return rest;
         });
       }
@@ -1290,8 +1299,16 @@ class TimelineEditor {
   }
 
   // Force all start/end/duration widgets to match the retake video's duration exactly.
-  syncWidgetsToRetakeDuration(durationFrames) {
-    if (durationFrames <= 0) return;
+  syncWidgetsToRetakeDuration(durationFrames, asFloor = false) {
+    // A5 defense-in-depth: `<= 0` lets undefined/NaN through (undefined<=0 is false), which
+    // would zero the duration widgets and collapse output. Require a positive finite number.
+    if (!(durationFrames > 0)) return;
+    // Extend support: when asFloor, the base-video length is a MINIMUM, not a lock — a larger
+    // user-set duration is preserved so a retake can be extended past the source. Initial syncs
+    // (toggle into retake / new upload) pass asFloor=false and still snap exactly to the video.
+    if (asFloor && this.durationFramesWidget) {
+      durationFrames = Math.max(durationFrames, parseInt(this.durationFramesWidget.value) || 0);
+    }
     const rate = this.getFrameRate();
     const durationSeconds = parseFloat((durationFrames / rate).toFixed(3));
 
@@ -1351,7 +1368,12 @@ class TimelineEditor {
         const baseVideoDur = this.timeline.retakeVideo.videoDurationFrames || 0;
         // Add 15% visual buffer duration on the right to prevent the video segment
         // from being cut off by the DOM clipping (right ~9% of the viewport is clipped by ComfyUI).
-        return Math.max(24, Math.ceil(baseVideoDur * 1.15));
+        // Extend support: span the FULL output duration (base video or extension, whichever is
+        // longer) and apply the ~15% buffer to that span — not just the base — so the END of an
+        // extension isn't swallowed by ComfyUI's clipped right edge. This makes the retake timeline
+        // behave like the prompt-relay timeline: extend natively and zoom out to see the whole thing.
+        const retakeSpan = Math.max(baseVideoDur, this.getDurationFrames());
+        return Math.max(24, Math.ceil(retakeSpan * 1.15));
       } else {
         return 24;
       }
@@ -1681,7 +1703,7 @@ class TimelineEditor {
         seg.videoDurationFrames = Math.max(1, Math.ceil(seg.videoEl.duration * frameRate));
       }
       if (this.retakeMode && seg === this.timeline.retakeVideo && seg.videoDurationFrames) {
-        this.syncWidgetsToRetakeDuration(seg.videoDurationFrames);
+        this.syncWidgetsToRetakeDuration(seg.videoDurationFrames, true);
         this.updateZoomSliderMax();
         this.commitChanges(true);
       }
@@ -1704,7 +1726,7 @@ class TimelineEditor {
         seg.videoDurationFrames = Math.max(1, Math.ceil(seg.videoEl.duration * frameRate));
       }
       if (this.retakeMode && seg === this.timeline.retakeVideo && seg.videoDurationFrames) {
-        this.syncWidgetsToRetakeDuration(seg.videoDurationFrames);
+        this.syncWidgetsToRetakeDuration(seg.videoDurationFrames, true);
         this.updateZoomSliderMax();
         this.commitChanges(true);
       }
@@ -2017,12 +2039,29 @@ class TimelineEditor {
   }
 
 
+  _hydrateImageFromFile(seg) {
+    // Externally-authored timelines (e.g. the storyboard skill) reference images
+    // by server path only, with no embedded imageB64 — so resolve imageFile to a
+    // /view URL and build the preview. Mirrors the "Replace with..." upload path.
+    const parts = (seg.imageFile || "").split(/[/\\]/);
+    const justName = parts.pop() || "";
+    if (!justName) return;
+    const subfolder = parts.join("/");
+    const imgUrl = api.apiURL(`/view?filename=${encodeURIComponent(justName)}&type=input&subfolder=${encodeURIComponent(subfolder)}`);
+    seg.imageB64 = imgUrl;
+    seg.imgObj = new Image();
+    seg.imgObj.onload = () => { if (!this._isDragging) this.render(); };
+    seg.imgObj.src = imgUrl;
+  }
+
   loadMedia() {
     for (const seg of this.timeline.segments) {
       if (seg.imageB64 && !seg.imgObj) {
         seg.imgObj = new Image();
         seg.imgObj.onload = () => { if (!this._isDragging) this.render(); };
         seg.imgObj.src = seg.imageB64;
+      } else if (seg.type === "image" && seg.imageFile && !seg.imgObj) {
+        this._hydrateImageFromFile(seg);
       }
       if (seg.type === "video") {
         this._ensureVideoEl(seg);
@@ -2037,8 +2076,10 @@ class TimelineEditor {
           seg.imgObj = new Image();
           seg.imgObj.onload = () => { if (!this._isDragging) this.render(); };
           seg.imgObj.src = seg.imageB64;
+        } else if (seg.isStaticRef && seg.imageFile && !seg.imgObj) {
+          this._hydrateImageFromFile(seg);
         }
-        if (seg.type === "motion_video" && !seg.isStaticRef) {
+        if (seg.type === "motion_video") {
           this._ensureVideoEl(seg);
           this._ensureThumbnails(seg);
           if (isOverrideAudio) {
@@ -2210,7 +2251,7 @@ class TimelineEditor {
 
     this.motionFileInput = document.createElement("input");
     this.motionFileInput.type = "file";
-    this.motionFileInput.accept = "video/*,image/*";
+    this.motionFileInput.accept = "video/*";
     this.motionFileInput.multiple = true;
     this.motionFileInput.style.display = "none";
     this.motionFileInput.addEventListener("change", (e) => this.handleMotionUpload(e.target.files));
@@ -2220,11 +2261,7 @@ class TimelineEditor {
     this.videoFileInput.accept = "video/*";
     this.videoFileInput.multiple = true;
     this.videoFileInput.style.display = "none";
-    this.videoFileInput.addEventListener("change", (e) => {
-      const files = e.target.files;
-      e.target.value = ""; // reset up front so the button works again even if an upload hangs
-      this.handleVideoUpload(files);
-    });
+    this.videoFileInput.addEventListener("change", (e) => this.handleVideoUpload(e.target.files));
 
     const uploadBtn = document.createElement("button");
     uploadBtn.className = "pr-btn";
@@ -2284,6 +2321,32 @@ class TimelineEditor {
     });
     this.deleteRetakeBtn = deleteRetakeBtn;
     actionGroup.appendChild(deleteRetakeBtn);
+
+    // D3 second add affordance: "+ Add beat" — inserts an image keyframe at the playhead
+    // (clamped into the open region). Shown only in retake mode with a video loaded.
+    // Hidden file input reuses the same image-upload path as drag-drop.
+    this.addBeatFileInput = document.createElement("input");
+    this.addBeatFileInput.type = "file";
+    this.addBeatFileInput.accept = "image/*";
+    this.addBeatFileInput.multiple = false;
+    this.addBeatFileInput.style.display = "none";
+    this.addBeatFileInput.addEventListener("change", (e) => {
+      if (e.target.files && e.target.files.length > 0) {
+        // targetFrameStart=null → handleImageUpload's retake path places it at the
+        // playhead, clamped to the open region (§1.7).
+        this.handleImageUpload(e.target.files, null);
+      }
+      this.addBeatFileInput.value = "";
+    });
+    const addBeatBtn = document.createElement("button");
+    addBeatBtn.className = "pr-btn";
+    addBeatBtn.innerHTML = "+ Add beat";
+    addBeatBtn.title = "Add an image keyframe (beat) at the playhead";
+    addBeatBtn.style.display = "none"; // hidden until retakeMode + video loaded
+    addBeatBtn.addEventListener("click", () => this.addBeatFileInput.click());
+    this.addBeatBtn = addBeatBtn;
+    actionGroup.appendChild(this.addBeatFileInput);
+    actionGroup.appendChild(addBeatBtn);
 
     toolbar.appendChild(actionGroup);
 
@@ -2932,7 +2995,14 @@ class TimelineEditor {
 
     this.promptInput.addEventListener("input", () => {
       if (this.retakeMode) {
-        this.timeline.retakePrompt = this.promptInput.value;
+        // §1.8: with a beat selected, the box edits that beat's prompt; with no beat
+        // selected it edits the open region's default (retakePrompt).
+        if (this.selectionType === "image" && this.timeline.segments[this.selectedIndex]
+            && this._isOpenRegionSegment(this.timeline.segments[this.selectedIndex])) {
+          this.timeline.segments[this.selectedIndex].prompt = this.promptInput.value;
+        } else {
+          this.timeline.retakePrompt = this.promptInput.value;
+        }
         this.commitChanges();
         return;
       }
@@ -2972,7 +3042,27 @@ class TimelineEditor {
       this.wrapper.classList.add("drag-active");
 
       if (this.retakeMode) {
-        return; // Skip ghost segments rendering when in retakeMode
+        // §1.10 live drop-target feedback. Compute the snapped target + validity and
+        // stash it for the render pass; never build normal-mode ghost segments here.
+        if (this.timeline.retakeVideo) {
+          const { x } = this.getMousePos(e);
+          const logicalWidth = this.canvas.offsetWidth;
+          const totalFrames = this.getVisualDurationFrames();
+          if (logicalWidth && totalFrames > 0) {
+            const frame = x * (totalFrames / logicalWidth);
+            const { openStart, openEnd } = this._getOpenRegion();
+            const len = Math.min(this.getFrameRate(), Math.max(0, openEnd - openStart));
+            // valid iff the open region has room AND the cursor is over it (or its extension).
+            const overOpen = frame >= openStart && frame < openEnd;
+            // L1 (Invariant #9): round the drop target to an integer frame at this ENTRY
+            // boundary so a fractional drop x can never seed a fractional segment.start.
+            const targetStart = Math.round(Math.max(openStart, Math.min(frame - len / 2, openEnd - len)));
+            this._retakeDropPreview = { valid: openEnd > openStart && (overOpen || frame >= openStart), targetStart, len, openStart, openEnd };
+            e.dataTransfer.dropEffect = this._retakeDropPreview.valid ? "copy" : "none";
+            this.render();
+          }
+        }
+        return; // never build normal-mode ghost segments in retake
       }
 
       const { x, y } = this.getMousePos(e);
@@ -3037,6 +3127,7 @@ class TimelineEditor {
         this._ghostTrack = null;
         this._ghostInitialTimeline = null;
         this._previewSegments = null;
+        this._retakeDropPreview = null;
         this.render();
       }
     });
@@ -3049,6 +3140,10 @@ class TimelineEditor {
       let targetFrameStart = null;
       let targetTrack = this._ghostTrack || "image";
 
+      // Retake: the drop lands at the live preview's snapped target (drop-at-cursor-x, §1.10).
+      const retakeDrop = this.retakeMode ? this._retakeDropPreview : null;
+      if (retakeDrop) targetFrameStart = retakeDrop.targetStart;
+
       if (this._ghostSegmentId && this._previewSegments) {
         const ghost = this._previewSegments.find(s => s.id === this._ghostSegmentId);
         if (ghost) {
@@ -3059,6 +3154,7 @@ class TimelineEditor {
       this._ghostTrack = null;
       this._ghostInitialTimeline = null;
       this._previewSegments = null;
+      this._retakeDropPreview = null;
       this.render();
 
       if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
@@ -3082,8 +3178,10 @@ class TimelineEditor {
         } else if (audioFiles.length > 0 && (targetTrack === "audio" || imageFiles.length === 0)) {
           this.handleAudioUpload(audioFiles, targetFrameStart);
         } else if (imageFiles.length > 0) {
-          if (targetTrack === "motion") {
-            this.handleMotionUpload(imageFiles, targetFrameStart);
+          // §1.10: in retake, reject a drop with no valid open-region target (entirely in
+          // frozen base / no room) with a red flash instead of silently creating a beat.
+          if (this.retakeMode && this.timeline.retakeVideo && !retakeDrop) {
+            this._flashRetakeReject();
           } else {
             this.handleImageUpload(imageFiles, targetFrameStart);
           }
@@ -3441,7 +3539,16 @@ class TimelineEditor {
       val = Math.max(0, Math.min(1, val));
       this.strengthValue.value = val.toFixed(2);
       if (this.retakeMode) {
-        this.timeline.retakeStrength = val;
+        // D5: a selected open-region beat's strength is its own guideStrength; with no
+        // beat selected the field drives the open region's retakeStrength.
+        const selBeat = (this.selectionType === "image" && this.timeline.segments[this.selectedIndex]
+          && this._isOpenRegionSegment(this.timeline.segments[this.selectedIndex]))
+          ? this.timeline.segments[this.selectedIndex] : null;
+        if (selBeat) {
+          selBeat.guideStrength = val;
+        } else {
+          this.timeline.retakeStrength = val;
+        }
         this.commitChanges();
       } else if (this.selectionType === "image" && this.timeline.segments[this.selectedIndex]) {
         const seg = this.timeline.segments[this.selectedIndex];
@@ -3906,14 +4013,358 @@ class TimelineEditor {
     return { x, y };
   }
 
+  // Open region geometry (§1.2). Returns the pixel span [openStart, openEnd) the
+  // retake user may place beats in: the union of the retake window and the
+  // extension tail, clamped to the REAL output span (never the ×1.15 visual span).
+  // openEnd <= endFrames guarantees the §3.1 tiling sums to the output span.
+  _getOpenRegion() {
+    const startFrames = this.getStartFrames();
+    const endFrames = startFrames + this.getDurationFrames();
+    const retakeStart = this.timeline.retakeStart ?? 0;
+    const baseVideoDur = this.timeline.retakeVideo?.videoDurationFrames ?? (endFrames - startFrames);
+    const retakeLength = this.timeline.retakeLength ?? baseVideoDur;
+    const windowEnd = retakeStart + retakeLength;
+    const openEndRaw = windowEnd > baseVideoDur ? Math.max(windowEnd, baseVideoDur) : windowEnd;
+    const openStart = Math.max(retakeStart, startFrames);
+    // HOLE1: collapse an inverted window so openEnd >= openStart (agrees with the tiling).
+    const openEnd = Math.max(Math.min(openEndRaw, endFrames), openStart);
+    return { openStart, openEnd };
+  }
+
+  // Clamp a card span [start, start+length) into the open region (§1.10). If the
+  // card is longer than the open span, it is shrunk to fit. Returns the clamped
+  // start; callers may also clamp length via the returned openEnd.
+  _clampCardToOpenRegion(start, length) {
+    const { openStart, openEnd } = this._getOpenRegion();
+    const span = Math.max(0, openEnd - openStart);
+    const len = Math.min(length, span);
+    let s = Math.max(openStart, Math.min(start, openEnd - len));
+    return { start: s, length: len, openStart, openEnd };
+  }
+
+  // A4 (breaker): find a NON-OVERLAPPING slot of `length` in the open region, preferring
+  // the first free gap at/after `desired`, then the earliest gap from openStart. Existing
+  // open-region beats (incl. ones placed earlier in the same batch) are treated as walls.
+  // Returns {start, length} clamped to the open region, or null if no gap fits — so a
+  // multi-file batch places cards sequentially instead of stacking them at openEnd-len
+  // (which the tiling left-trim would silently merge, losing beats). `excludeId` skips the
+  // card being (re)placed.
+  _findOpenRegionSlot(desired, length, excludeId = null) {
+    const { openStart, openEnd } = this._getOpenRegion();
+    const span = Math.max(0, openEnd - openStart);
+    if (span <= 0) return null;
+    const len = Math.min(length, span);
+    // Occupied intervals from existing open-region beats, clipped to the open span, sorted.
+    const occ = this._getOpenRegionCards()
+      .filter((c) => c.id !== excludeId)
+      .map((c) => [Math.max(openStart, c.start), Math.min(openEnd, c.start + c.length)])
+      .filter(([a, b]) => b > a)
+      .sort((p, q) => p[0] - q[0]);
+    // Free gaps in [openStart, openEnd) between occupied intervals.
+    const gaps = [];
+    let cur = openStart;
+    for (const [a, b] of occ) {
+      if (a > cur) gaps.push([cur, a]);
+      cur = Math.max(cur, b);
+    }
+    if (cur < openEnd) gaps.push([cur, openEnd]);
+    // Prefer the gap containing/after `desired`; place flush at max(gapStart, desired).
+    const fits = gaps.filter(([a, b]) => b - a >= len);
+    if (fits.length === 0) return null;
+    const clampedDesired = Math.max(openStart, Math.min(desired, openEnd - len));
+    let chosen = fits.find(([a, b]) => clampedDesired >= a && clampedDesired + len <= b)
+      || fits.find(([a]) => a >= clampedDesired)
+      || fits[0];
+    const s = Math.max(chosen[0], Math.min(clampedDesired, chosen[1] - len));
+    return { start: Math.round(s), length: len };
+  }
+
+  // Resize walls for a beat being edge-dragged: how far its left/right edge may travel.
+  // Bounded by the open region and by the nearest neighbour beat on each side (treated as
+  // walls, so a resize can never overlap/merge another beat). Computed from the ORIGINAL
+  // (pre-drag) span so neighbour classification stays stable across the drag.
+  _beatResizeWalls(cardId, origStart, origEnd) {
+    const { openStart, openEnd } = this._getOpenRegion();
+    let leftWall = openStart, rightWall = openEnd;
+    for (const c of this._getOpenRegionCards()) {
+      if (c.id === cardId) continue;
+      const ce = c.start + c.length;
+      if (ce <= origStart) leftWall = Math.max(leftWall, ce);     // neighbour fully left
+      if (c.start >= origEnd) rightWall = Math.min(rightWall, c.start); // neighbour fully right
+    }
+    return { leftWall, rightWall };
+  }
+
+  // Whether a single segment's span intersects the open region (§2 membership test).
+  _isOpenRegionSegment(seg) {
+    if (!this.retakeMode || !this.timeline.retakeVideo || !seg) return false;
+    const { openStart, openEnd } = this._getOpenRegion();
+    if (openEnd <= openStart) return false;
+    return seg.start < openEnd && seg.start + seg.length > openStart;
+  }
+
+  // Segments that count as open-region beats (§2): image/video cards whose span
+  // intersects the open region. Membership is derived, never stored (no retakeOwned flag).
+  _getOpenRegionCards() {
+    if (!this.retakeMode || !this.timeline.retakeVideo) return [];
+    const { openStart, openEnd } = this._getOpenRegion();
+    if (openEnd <= openStart) return [];
+    return this.timeline.segments.filter((s) => {
+      const t = s.type === undefined ? "image" : s.type;
+      if (t !== "image" && t !== "video") return false;
+      return s.start < openEnd && s.start + s.length > openStart; // positive overlap
+    });
+  }
+
+  // Screen rect for a beat card in the CARD ZONE (§1.1). x/width from the frame→pixel
+  // mapping (visual span, for DRAWING only — §1.2); y/height from the card zone band.
+  _cardScreenRect(seg) {
+    const logicalWidth = this.canvas.offsetWidth;
+    const totalFrames = this.getVisualDurationFrames();
+    if (!logicalWidth || totalFrames <= 0) return null;
+    const x = (seg.start / totalFrames) * logicalWidth;
+    const w = Math.max(2, (seg.length / totalFrames) * logicalWidth);
+    const cardZoneTop = RULER_HEIGHT + this.blockHeight * RETAKE_CHROME_FRAC;
+    const cardZoneH = this.blockHeight * (1 - RETAKE_CHROME_FRAC);
+    return { x, y: cardZoneTop + 2, w, h: cardZoneH - 4 };
+  }
+
+  // §1.1/§1.6.1 scoped render pass for open-region beat cards. Draws the two-zone
+  // divider, the empty-state hint, and each card with min-width degrade tiers and the
+  // selected/dimmed highlight. Drawing only — all geometry via _cardScreenRect.
+  _renderOpenRegionCards(width, totalFrames) {
+    const ctx = this.ctx;
+    const { openStart, openEnd } = this._getOpenRegion();
+    const cardZoneTop = RULER_HEIGHT + this.blockHeight * RETAKE_CHROME_FRAC;
+
+    // 1px divider between chrome zone and card zone (§1.1), full width, persistent.
+    ctx.save();
+    ctx.strokeStyle = "#3a3a3a";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, cardZoneTop + 0.5);
+    ctx.lineTo(width, cardZoneTop + 0.5);
+    ctx.stroke();
+    ctx.restore();
+
+    // §1.3 hard boundary lines + lock glyphs. The frozen↔open and base↔extension seams
+    // are explicit 1px edges (not just tint), and frozen spans carry a 🔒 so frozen-vs-open
+    // never relies on tint value alone. Pixels via the visual span (drawing only, §1.2).
+    {
+      const bandTop = RULER_HEIGHT + 1;
+      const bandH = this.blockHeight - 2;
+      const retakeStart = this.timeline.retakeStart ?? 0;
+      const baseVideoDur = this.timeline.retakeVideo?.videoDurationFrames ?? 0;
+      const f2px = (f) => (f / totalFrames) * width;
+      const drawSeam = (frame) => {
+        const px = f2px(frame);
+        if (px <= 0 || px >= width) return;
+        ctx.save();
+        ctx.strokeStyle = "rgba(255,255,255,0.85)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(Math.round(px) + 0.5, bandTop);
+        ctx.lineTo(Math.round(px) + 0.5, bandTop + bandH);
+        ctx.stroke();
+        ctx.restore();
+      };
+      drawSeam(retakeStart);                                  // frozen-before ↔ open seam
+      if (baseVideoDur > 0 && openEnd > baseVideoDur) drawSeam(baseVideoDur); // base ↔ extension
+
+      // Lock glyph centered in each frozen span (before openStart, and after openEnd
+      // up to baseVideoDur — the interior preserve, if any).
+      ctx.save();
+      ctx.font = "13px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "rgba(255,255,255,0.55)";
+      const glyphY = RULER_HEIGHT + this.blockHeight * RETAKE_CHROME_FRAC / 2;
+      const frozenSpans = [];
+      if (openStart > 0) frozenSpans.push([0, openStart]);
+      if (baseVideoDur > openEnd) frozenSpans.push([openEnd, baseVideoDur]);
+      for (const [a, b] of frozenSpans) {
+        const cx = (f2px(a) + f2px(b)) / 2;
+        if (f2px(b) - f2px(a) >= 16) ctx.fillText("🔒", cx, glyphY);
+      }
+      ctx.restore();
+
+      // §1.10 invalid-drop red flash over frozen spans while the flash window is active.
+      if (this._retakeRejectFlashUntil && performance.now() < this._retakeRejectFlashUntil) {
+        ctx.save();
+        ctx.fillStyle = "rgba(220, 40, 40, 0.35)";
+        for (const [a, b] of frozenSpans) {
+          ctx.fillRect(f2px(a), bandTop, f2px(b) - f2px(a), bandH);
+        }
+        ctx.restore();
+      }
+    }
+
+    // §1.4 one-time tip on first retake-video load: show for ~6s, then persist a node
+    // property so it never re-shows in future sessions. Drawn across the card zone.
+    if (this.node?.properties && !this.node.properties.retakeBeatsTipSeen) {
+      if (!this._retakeTipShownAt) this._retakeTipShownAt = performance.now();
+      const elapsed = performance.now() - this._retakeTipShownAt;
+      if (elapsed < 6000) {
+        ctx.save();
+        const ty = RULER_HEIGHT + this.blockHeight - 18;
+        ctx.fillStyle = "rgba(0,0,0,0.72)";
+        ctx.fillRect(8, ty - 11, width - 16, 22);
+        ctx.fillStyle = "#fff";
+        ctx.font = "11px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("Drag images into the lit region to add beats; the dark locked parts are preserved.", width / 2, ty);
+        ctx.restore();
+        if (elapsed < 5800) requestAnimationFrame(() => this.render());
+      } else {
+        this.node.properties.retakeBeatsTipSeen = true; // mark seen after the window elapses
+      }
+    }
+
+    const cards = this._getOpenRegionCards();
+    const selId = (this.selectedIndex != null && this.timeline.segments[this.selectedIndex])
+      ? this.timeline.segments[this.selectedIndex].id : null;
+
+    // Empty-state hint (§1.4): only when the open region exists and holds no beat.
+    if (cards.length === 0) {
+      if (openEnd > openStart) {
+        const hx1 = (openStart / totalFrames) * width;
+        const hx2 = (openEnd / totalFrames) * width;
+        ctx.save();
+        ctx.fillStyle = "rgba(255,255,255,0.55)";
+        ctx.font = "12px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("drag an image here to add a beat",
+          (hx1 + hx2) / 2, cardZoneTop + this.blockHeight * (1 - RETAKE_CHROME_FRAC) / 2);
+        ctx.restore();
+      }
+      this._drawRetakeDropPreview(width, totalFrames, openStart, openEnd);
+      return;
+    }
+
+    for (const seg of cards) {
+      const r = this._cardScreenRect(seg);
+      if (!r) continue;
+      const isSel = seg.id === selId;
+      // Selected card bright; others dimmed (§1.3/§1.8 canvas half of the indicator).
+      ctx.save();
+      ctx.globalAlpha = selId && !isSel ? 0.55 : 1.0;
+
+      // Card body
+      ctx.fillStyle = "#1c1c1c";
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+
+      // Thumbnail (left), drawn when the card is wide enough (§1.6.1 tiers).
+      const orig = this.timeline.segments.find(s => s.id === seg.id);
+      const imgObj = orig ? orig.imgObj : seg.imgObj;
+      const showThumb = r.w >= 36 && imgObj && imgObj.complete;
+      const thumbW = showThumb ? Math.min(r.h, r.w) : 0;
+      if (showThumb) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(r.x, r.y, thumbW, r.h);
+        ctx.clip();
+        const natW = imgObj.naturalWidth || 1, natH = imgObj.naturalHeight || 1;
+        const ratio = natW / natH;
+        let dw = thumbW, dh = thumbW / ratio;
+        if (dh < r.h) { dh = r.h; dw = r.h * ratio; }
+        ctx.drawImage(imgObj, r.x + (thumbW - dw) / 2, r.y + (r.h - dh) / 2, dw, dh);
+        ctx.restore();
+      }
+
+      // Degrade tiers: full(prompt) ≥140, thumb+badge ≥36, badge-only <36.
+      const beatNum = cards.indexOf(seg) + 1;
+      if (r.w >= 140) {
+        const txt = (seg.prompt || "").trim() || "(no prompt)";
+        ctx.fillStyle = "#fff";
+        ctx.font = "11px sans-serif";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        const tx = r.x + thumbW + 6;
+        const maxW = r.x + r.w - tx - 6;
+        let disp = txt;
+        if (ctx.measureText(disp).width > maxW) {
+          while (disp.length && ctx.measureText(disp + "…").width > maxW) disp = disp.slice(0, -1);
+          disp += "…";
+        }
+        ctx.fillText(disp, tx, r.y + r.h / 2);
+      } else {
+        // number badge chip
+        ctx.fillStyle = "rgba(0,0,0,0.65)";
+        const bw = 16, bh = 14;
+        ctx.fillRect(r.x + 2, r.y + 2, bw, bh);
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 10px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(String(beatNum), r.x + 2 + bw / 2, r.y + 2 + bh / 2);
+      }
+
+      // Border (selected = bright accent).
+      ctx.strokeStyle = isSel ? "#4aa3ff" : "#555";
+      ctx.lineWidth = isSel ? 2 : 1;
+      ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+      ctx.restore();
+    }
+
+    this._drawRetakeDropPreview(width, totalFrames, openStart, openEnd);
+  }
+
+  // §1.10 live drag-over preview: accent outline over the open span + insertion marker
+  // at the snapped target when valid (the not-allowed cursor is set via dropEffect).
+  _drawRetakeDropPreview(width, totalFrames, openStart, openEnd) {
+    const dp = this._retakeDropPreview;
+    if (!dp || !dp.valid || openEnd <= openStart) return;
+    const ctx = this.ctx;
+    const f2px = (f) => (f / totalFrames) * width;
+    const ox1 = f2px(openStart), ox2 = f2px(openEnd);
+    const bandTop = RULER_HEIGHT + 1, bandH = this.blockHeight - 2;
+    ctx.save();
+    ctx.strokeStyle = "#4aa3ff";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(ox1 + 1, bandTop + 1, Math.max(0, ox2 - ox1 - 2), bandH - 2);
+    const mx = f2px(dp.targetStart);
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(Math.round(mx) + 0.5, bandTop);
+    ctx.lineTo(Math.round(mx) + 0.5, bandTop + bandH);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // §1.10 invalid-drop feedback: flash the frozen spans red briefly, then clear.
+  _flashRetakeReject() {
+    this._retakeRejectFlashUntil = performance.now() + 450;
+    const tick = () => {
+      this.render();
+      if (performance.now() < this._retakeRejectFlashUntil) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+
+  // Hit-test a click against open-region cards (topmost/last-drawn wins).
+  _hitTestOpenRegionCard(x, y) {
+    const cards = this._getOpenRegionCards();
+    for (let i = cards.length - 1; i >= 0; i--) {
+      const r = this._cardScreenRect(cards[i]);
+      if (r && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return cards[i];
+    }
+    return null;
+  }
+
   // --- Async Image Upload Logic (Handles multiple images simultaneously) ---
   async handleImageUpload(files, targetFrameStart = null, explicitLength = null) {
     const frameRate = this.getFrameRate();
     const durationFrames = this.getDurationFrames();
-    const newLength = explicitLength !== null ? explicitLength : frameRate * 1; // Default to 1 second long
+    const baseNewLength = explicitLength !== null ? explicitLength : frameRate * 1; // Default to 1 second long
 
     for (let file of files) {
       if (!file.type.startsWith("image/")) continue;
+      // Per-file working length (retake may shrink a beat to fit the open span);
+      // reset from the base each iteration so a prior shrink can't leak forward.
+      let newLength = baseNewLength;
 
       await new Promise(async (resolve) => {
         try {
@@ -3933,7 +4384,10 @@ class TimelineEditor {
           img.onload = () => {
 
             let newStart = targetFrameStart;
-            if (newStart === null) {
+            // The normal-mode free-slot fallback does not apply in retake (beats are
+            // placed by the open-region clamp below); leave newStart null there so the
+            // retake block can default to the playhead (§1.7 "+ Add beat at playhead").
+            if (newStart === null && !this.retakeMode) {
               // Fallback: find the first free slot, or append past the end
               newStart = 0;
               this.timeline.segments.sort((a, b) => a.start - b.start);
@@ -3944,11 +4398,51 @@ class TimelineEditor {
               }
             }
 
+            // --- Retake mode: a beat (image keyframe) lives only in the open region. ---
+            // Bypass the normal-mode global push-physics (which clamps against [0,duration]
+            // and has no open-region concept, §5.2) and instead clamp the card into the
+            // open span. D6: a drop past the window end auto-extends the window to fit.
+            if (this.retakeMode) {
+              const desired = newStart !== null ? newStart : (this.currentFrame ?? 0);
+              // D6 auto-extend-on-drop: grow the retake window if the beat lands past openEnd.
+              let region = this._getOpenRegion();
+              if (desired + newLength > region.openEnd) {
+                const retakeStart = this.timeline.retakeStart ?? 0;
+                // The window must reach the new beat's end; the output duration grows with it.
+                const neededEnd = Math.round(desired + newLength);
+                const newRetakeLength = Math.max(this.timeline.retakeLength ?? 0, neededEnd - retakeStart);
+                this.timeline.retakeLength = newRetakeLength;
+                // A5 (breaker): syncWidgetsToRetakeDuration REQUIRES a durationFrames arg —
+                // calling it bare set the output-duration widgets to undefined/NaN, collapsing
+                // output to the 24-frame fallback. Pass the extended window end with asFloor=true
+                // (floors against the current duration so it never shrinks), matching the
+                // retake_left/right drag-extend calls (js:8103/8153).
+                if (typeof this.syncWidgetsToRetakeDuration === "function") {
+                  this.syncWidgetsToRetakeDuration(retakeStart + newRetakeLength, true);
+                }
+                region = this._getOpenRegion();
+              }
+              // A4: place SEQUENTIALLY in the first free gap at/after `desired` so a
+              // multi-file batch never stacks cards at openEnd-len (which the tiling
+              // left-trim would silently merge → lost beats). If nothing fits, reject this
+              // file with a warning flash instead of silently dropping/merging it.
+              const slot = this._findOpenRegionSlot(desired, newLength);
+              if (!slot) {
+                if (typeof this._flashRetakeReject === "function") this._flashRetakeReject();
+                console.warn("[LTXDirector] retake open region full — beat not placed (no room for this image).");
+                resolve();
+                return;
+              }
+              newStart = slot.start;
+              newLength = slot.length;
+              targetFrameStart = newStart + newLength; // for the next file in a batch
+            }
+
             // Use the visual timeline as the physics bound so segments can
             // land anywhere in the padded visual area without touching duration_frames.
             const currentDuration = this.getVisualDurationFrames();
 
-            if (targetFrameStart !== null) {
+            if (targetFrameStart !== null && !this.retakeMode) {
               // Resolve physics to push existing segments
               let tempId = "TEMP_" + Date.now();
               this.timeline.segments.push({ id: tempId, start: newStart, length: newLength, type: "temp" });
@@ -4143,6 +4637,7 @@ class TimelineEditor {
           this._ensureThumbnails(this.timeline.retakeVideo);
 
           this.syncWidgetsToRetakeDuration(clipFrames);
+          this.updateRetakeUIState(); // reveal "+ Add beat" now that a base video is loaded
           this.commitChanges(true);
           this.render();
           resolve();
@@ -4252,26 +4747,18 @@ class TimelineEditor {
 
             // Extract first-frame thumbnail from local blob — instant
             vid.currentTime = 0.01;
-            let seekHandled = false;
-            const onSeekReady = () => {
-              if (seekHandled) return;            // onseeked and the watchdog must not both run
-              seekHandled = true;
-              clearTimeout(seekWatchdog);
+            vid.onseeked = () => {
               vid.onseeked = null;
-              try {
-                const canvas = document.createElement('canvas');
-                canvas.width = Math.min(vid.videoWidth, 512) || 512;
-                canvas.height = Math.round((vid.videoHeight / vid.videoWidth) * canvas.width) || 288;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
-                vidSeg.imageB64 = canvas.toDataURL('image/jpeg');
+              const canvas = document.createElement('canvas');
+              canvas.width = Math.min(vid.videoWidth, 512);
+              canvas.height = Math.round((vid.videoHeight / vid.videoWidth) * canvas.width);
+              const ctx = canvas.getContext('2d');
+              ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
+              vidSeg.imageB64 = canvas.toDataURL('image/jpeg');
 
-                const imgObj = new Image();
-                imgObj.onload = () => { vidSeg.imgObj = imgObj; this.render(); };
-                imgObj.src = vidSeg.imageB64;
-              } catch (e) {
-                console.warn("[LTXDirector] thumbnail capture failed, continuing without it", e);
-              }
+              const imgObj = new Image();
+              imgObj.onload = () => { vidSeg.imgObj = imgObj; this.render(); };
+              imgObj.src = vidSeg.imageB64;
 
               // Add to timeline immediately
               this.timeline.segments.push(vidSeg);
@@ -4378,9 +4865,6 @@ class TimelineEditor {
                 this.render();
               });
             };
-            // ponytail: some VFR / odd-codec mp4s never fire onseeked → 5s watchdog so add-video can't wedge
-            const seekWatchdog = setTimeout(onSeekReady, 5000);
-            vid.onseeked = onSeekReady;
           };
 
           vid.onerror = (e) => {
@@ -4449,89 +4933,7 @@ class TimelineEditor {
     const frameRate = this.getFrameRate();
 
     for (let file of files) {
-      const isImageRef = file.type.startsWith("image/") || !!file.name.toLowerCase().match(/\.(png|jpe?g|webp|bmp|gif)$/);
-      const isVideo = file.type.startsWith("video/") || !!file.name.toLowerCase().match(/\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv)$/);
-      if (!isImageRef && !isVideo) continue;
-
-      if (isImageRef) {
-        // Static IC reference image (e.g. the Ingredients IC-LoRA): add a motion segment
-        // that loops this single still across its span. The backend loads the image and
-        // repeats it to the segment length, so it behaves like a looped static video —
-        // which is exactly what the official IC-LoRA pipeline does with a reference sheet.
-        await new Promise((resolve) => {
-          try {
-            const blobUrl = URL.createObjectURL(file);
-            const img = new Image();
-            img.onerror = () => { console.error("[LTXDirector] IC image load error"); URL.revokeObjectURL(blobUrl); resolve(); };
-            img.onload = () => {
-              // Default span = the whole output, since a reference sheet conditions the
-              // entire clip. It's meant to overlap the timeline, not be appended after
-              // existing clips — so default to start 0 rather than auto-placing past
-              // them (which would silently grow the render length). User can move it.
-              let newLength = Math.max(1, this.getDurationFrames());
-              let newStart = (targetFrameStart !== null) ? targetFrameStart : 0;
-
-              let imageB64 = "";
-              try {
-                const canvas = document.createElement('canvas');
-                canvas.width = Math.min(img.naturalWidth, 512) || 512;
-                canvas.height = Math.round((img.naturalHeight / img.naturalWidth) * canvas.width) || 512;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-                imageB64 = canvas.toDataURL('image/jpeg');
-              } catch (e) { /* cosmetic: fall back to no persisted thumbnail */ }
-
-              const seg = {
-                id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
-                type: "motion_video",
-                start: newStart,
-                length: newLength,
-                trimStart: 0,
-                videoDurationFrames: newLength,
-                videoFile: "",        // filled once upload completes (image path)
-                isStaticRef: true,    // metadata; backend also detects by extension
-                fileName: file.name,
-                videoStrength: 1.0,
-                videoAttentionStrength: 0.65,
-                resampleMode: "nearest",
-                imageB64: imageB64,
-                imgObj: img,
-                _uploading: true,
-                _blobUrl: blobUrl,
-                fileSize: file.size
-              };
-
-              this.timeline.motionSegments.push(seg);
-              this.timeline.motionSegments.sort((a, b) => a.start - b.start);
-              if (!this.retakeMode) this.growTimelineIfNeeded(seg.start + seg.length);
-              this.selectionType = "motion";
-              this.selectedIndex = this.timeline.motionSegments.findIndex(s => s.id === seg.id);
-              this.updateUIFromSelection();
-              this.commitChanges(true);
-              this.render();
-              resolve();
-
-              this._uploadVideoFile(file).then(filePath => {
-                for (let s of this.timeline.motionSegments) {
-                  if (s._blobUrl === blobUrl || s.id === seg.id) { s.videoFile = filePath; s._uploading = false; }
-                }
-                this.commitChanges(true);
-                this.render();
-              }).catch(err => {
-                console.error("[LTXDirector] Background IC image upload failed", err);
-                const s = this.timeline.motionSegments.find(s => s.id === seg.id);
-                if (s) s._uploading = false;
-                this.render();
-              });
-            };
-            img.src = blobUrl;
-          } catch (err) {
-            console.error("[LTXDirector] IC image processing failed", err);
-            resolve();
-          }
-        });
-        continue;
-      }
+      if (!(file.type.startsWith("video/") || file.name.toLowerCase().match(/\.(mp4|webm|mkv|avi|mov|m4v|flv|wmv)$/))) continue;
 
       await new Promise(async (resolve) => {
         try {
@@ -5525,16 +5927,44 @@ class TimelineEditor {
       if (this.promptWrapper) this.promptWrapper.style.display = "block";
       this.promptInput.disabled = false;
       this.promptInput.style.opacity = "1.0";
-      this.promptInput.placeholder = "Enter prompt for retake region...";
-      this.promptInput.value = this.timeline.retakePrompt || "";
 
-      this.strengthRow.style.display = "flex";
-      this.strengthLabel.style.display = "inline";
-      this.strengthLabel.textContent = "Guide Strength:";
-      this.strengthValue.style.display = "inline-block";
-      this.strengthValue.disabled = true;
-      this.strengthValue.style.opacity = "0.35";
-      this.strengthValue.value = (this.timeline.retakeStrength ?? 1.0).toFixed(2);
+      // §1.8 edit-target: a selected open-region beat edits its own prompt + strength;
+      // otherwise the box edits the open region's default (retakePrompt).
+      const selBeat = (this.selectionType === "image" && this.timeline.segments[this.selectedIndex]
+        && this._isOpenRegionSegment(this.timeline.segments[this.selectedIndex]))
+        ? this.timeline.segments[this.selectedIndex] : null;
+
+      if (selBeat) {
+        const beatNum = this._getOpenRegionCards().findIndex(s => s.id === selBeat.id) + 1;
+        this.promptInput.placeholder = "Prompt for this beat…";
+        this.promptInput.value = selBeat.prompt || "";
+        if (this.segmentPromptLabel) {
+          this.segmentPromptLabel.style.display = "block";
+          this.segmentPromptLabel.textContent = `Editing: Beat ${beatNum}`;
+        }
+        // Beat windows carry the per-card guideStrength (D5) — make it editable.
+        this.strengthRow.style.display = "flex";
+        this.strengthLabel.style.display = "inline";
+        this.strengthLabel.textContent = "Guide Strength:";
+        this.strengthValue.style.display = "inline-block";
+        this.strengthValue.disabled = false;
+        this.strengthValue.style.opacity = "1.0";
+        this.strengthValue.value = (selBeat.guideStrength ?? 1.0).toFixed(2);
+      } else {
+        this.promptInput.placeholder = "Enter prompt for retake region...";
+        this.promptInput.value = this.timeline.retakePrompt || "";
+        if (this.segmentPromptLabel) {
+          this.segmentPromptLabel.style.display = "block";
+          this.segmentPromptLabel.textContent = "Editing: Retake region";
+        }
+        this.strengthRow.style.display = "flex";
+        this.strengthLabel.style.display = "inline";
+        this.strengthLabel.textContent = "Guide Strength:";
+        this.strengthValue.style.display = "inline-block";
+        this.strengthValue.disabled = true;
+        this.strengthValue.style.opacity = "0.35";
+        this.strengthValue.value = (this.timeline.retakeStrength ?? 1.0).toFixed(2);
+      }
 
       this.vidStrLabel.style.display = "none";
       this.vidStrValue.style.display = "none";
@@ -5735,6 +6165,10 @@ class TimelineEditor {
     // deleteRetakeBtn is visible whenever Retake Mode is active
     if (this.deleteRetakeBtn) {
       this.deleteRetakeBtn.style.display = isRetake ? "" : "none";
+    }
+    // "+ Add beat" (D3) is visible only in retake mode with a base video loaded.
+    if (this.addBeatBtn) {
+      this.addBeatBtn.style.display = (isRetake && this.timeline.retakeVideo) ? "" : "none";
     }
 
     // 3. Update the toggle button class/title
@@ -6199,6 +6633,10 @@ class TimelineEditor {
         }
         this.ctx.restore();
 
+        // §1.1 scoped card pass: draw open-region beats in the CARD ZONE, on top of
+        // the retake chrome. Only open-region cards are drawn (normal-mode segments are
+        // ignored in retake). The 1px divider teaches the two-zone split.
+        this._renderOpenRegionCards(width, totalFrames);
       }
     } else {
       // --- Draw Image/Text Segments ---
@@ -7319,6 +7757,46 @@ class TimelineEditor {
         const x2 = ((retakeStart + retakeLength) / totalFrames) * logicalWidth;
         const threshold = HANDLE_HIT_PX;
 
+        // §1.1 two-zone split: cards live in the lower CARD ZONE. A click on a card
+        // (in the card zone) selects that beat and routes promptInput to it — checked
+        // BEFORE the retake_center fallback so selecting a beat never starts a window
+        // drag. Window handles live in the upper CHROME ZONE and are unaffected.
+        const cardZoneTop = RULER_HEIGHT + this.blockHeight * RETAKE_CHROME_FRAC;
+        if (this.timeline.retakeVideo && y >= cardZoneTop) {
+          const hitCard = this._hitTestOpenRegionCard(x, y);
+          if (hitCard) {
+            this.selectionType = "image";
+            this.selectedIndex = this.timeline.segments.findIndex(s => s.id === hitCard.id);
+            // Beat drag: grabbing an EDGE resizes the beat's prompt window (like a
+            // normal-mode segment); grabbing the BODY moves it. Both stay clamped to the
+            // open region and never overlap a neighbour; committed on mouseup by the
+            // generic retake drag handler. Edge grab only on cards wide enough to aim at.
+            const r = this._cardScreenRect(hitCard);
+            const EDGE = 6;
+            let dragType = "card_move";
+            if (r && r.w >= 24) {
+              if (Math.abs(x - r.x) <= EDGE) dragType = "card_resize_left";
+              else if (Math.abs(x - (r.x + r.w)) <= EDGE) dragType = "card_resize_right";
+            }
+            this._isDragging = true;
+            this._dragType = dragType;
+            this._dragCardId = hitCard.id;
+            this._dragStartX = x;
+            this._dragStartCardStart = hitCard.start;
+            this._dragStartCardLength = hitCard.length;
+            this.updateUIFromSelection();
+            this.render();
+            return;
+          }
+          // §1.8: a card-zone miss inside the open region deselects the active beat so the
+          // prompt box reverts to "Editing: Retake region". (The window center-drag still
+          // runs below for the actual move.) Only clears a stale beat selection.
+          if (this._isOpenRegionSegment(this.timeline.segments?.[this.selectedIndex])) {
+            this.selectedIndex = -1;
+            this.updateUIFromSelection();
+          }
+        }
+
         if (this.timeline.retakeVideo && Math.abs(x - x1) <= threshold) {
           this._isDragging = true;
           this._dragType = "retake_left";
@@ -7547,6 +8025,19 @@ class TimelineEditor {
         const x2 = ((retakeStart + retakeLength) / totalFrames) * logicalWidth;
         const threshold = HANDLE_HIT_PX;
 
+        // Card zone: a beat EDGE shows ew-resize (drag to widen/narrow), the beat BODY shows
+        // move. Takes priority over the window-handle cursors (which own the chrome zone).
+        const hoverCardZoneTop = RULER_HEIGHT + this.blockHeight * RETAKE_CHROME_FRAC;
+        if (mouseY >= hoverCardZoneTop) {
+          const hovCard = this._hitTestOpenRegionCard(mouseX, mouseY);
+          if (hovCard) {
+            const hr = this._cardScreenRect(hovCard);
+            const onEdge = hr && hr.w >= 24 && (Math.abs(mouseX - hr.x) <= 6 || Math.abs(mouseX - (hr.x + hr.w)) <= 6);
+            this.canvas.style.cursor = onEdge ? "ew-resize" : "move";
+            return;
+          }
+        }
+
         if (Math.abs(mouseX - x1) <= threshold || Math.abs(mouseX - x2) <= threshold) {
           this.canvas.style.cursor = "ew-resize";
         } else if (mouseX > x1 && mouseX < x2) {
@@ -7611,6 +8102,52 @@ class TimelineEditor {
       const deltaFrames = Math.round(deltaX * (totalFrames / logicalWidth));
 
       const frameRate = this.getFrameRate();
+
+      // Card-move drag: reposition the selected beat to the nearest free slot at the
+      // cursor. Gap-aware via _findOpenRegionSlot (excludes the dragged card) so it can
+      // never overlap/merge another beat — same placement rule as drop (A4). Frames stay
+      // integer (Invariant #9): deltaFrames is rounded and _findOpenRegionSlot Math.rounds.
+      if (this._dragType === "card_move") {
+        this.canvas.style.cursor = "grabbing";
+        const card = this.timeline.segments.find(s => s.id === this._dragCardId);
+        if (card) {
+          const desired = this._dragStartCardStart + deltaFrames;
+          const slot = this._findOpenRegionSlot(desired, card.length, card.id);
+          if (slot && slot.start !== card.start) {
+            card.start = slot.start;
+            // Keep the moved card selected by id (the array isn't reordered here).
+            this.selectedIndex = this.timeline.segments.findIndex(s => s.id === card.id);
+          }
+          this.render();
+        }
+        return;
+      }
+
+      // Beat edge-resize (like a normal-mode segment): drag the right edge to widen/narrow
+      // the beat's prompt window; the left edge moves the start while keeping the right edge
+      // fixed. Bounded by the open region + neighbour beats (no overlap), min length, integer
+      // frames (Inv #9). The image stays anchored at the beat's start.
+      if (this._dragType === "card_resize_right" || this._dragType === "card_resize_left") {
+        this.canvas.style.cursor = "ew-resize";
+        const card = this.timeline.segments.find(s => s.id === this._dragCardId);
+        if (card) {
+          const origStart = this._dragStartCardStart;
+          const origEnd = this._dragStartCardStart + this._dragStartCardLength;
+          const { leftWall, rightWall } = this._beatResizeWalls(card.id, origStart, origEnd);
+          if (this._dragType === "card_resize_right") {
+            const newEnd = clamp(Math.round(origEnd + deltaFrames), origStart + MIN_SEGMENT_LENGTH, rightWall);
+            card.start = origStart;
+            card.length = newEnd - origStart;
+          } else {
+            const newStart = clamp(Math.round(origStart + deltaFrames), leftWall, origEnd - MIN_SEGMENT_LENGTH);
+            card.start = newStart;
+            card.length = origEnd - newStart;
+          }
+          this.selectedIndex = this.timeline.segments.findIndex(s => s.id === card.id);
+          this.render();
+        }
+        return;
+      }
 
       // Handle playhead drag in retakeMode — the RAF loop is paused, so seek directly
       if (this._dragType === "playhead") {
@@ -7696,17 +8233,23 @@ class TimelineEditor {
           }
         }
 
-        if (this._dragStartRetakeStart + newLength > baseVideoDur) {
-          newLength = baseVideoDur - this._dragStartRetakeStart;
-        }
+        // Extend support: allow the right edge PAST the base video — that's how you lengthen the
+        // output. The span past the base is the regenerated extension; everything before
+        // retakeStart stays frozen. Cap at 4x the clip so a stray drag can't blow up the latent.
+        const EXTEND_CEILING = Math.max(baseVideoDur * 4, baseVideoDur + 1);
+        let rRightEnd = Math.min(this._dragStartRetakeStart + newLength, EXTEND_CEILING);
+        newLength = rRightEnd - this._dragStartRetakeStart;
         if (newLength < MIN_SEGMENT_LENGTH) {
           newLength = MIN_SEGMENT_LENGTH;
         }
 
         this.timeline.retakeLength = newLength;
+        // Output duration follows the region end (never below the base, which is always preserved).
+        this.syncWidgetsToRetakeDuration(Math.max(baseVideoDur, this.timeline.retakeStart + newLength), false);
 
         if (this.timeline.retakeVideo && this.timeline.retakeVideo.videoEl) {
-          this.timeline.retakeVideo.videoEl.currentTime = (this.timeline.retakeStart + newLength) / frameRate;
+          // scrub preview clamps to the real clip — you can't seek past its last frame
+          this.timeline.retakeVideo.videoEl.currentTime = Math.min(this.timeline.retakeStart + newLength, baseVideoDur) / frameRate;
         }
 
         this.render();
@@ -7744,11 +8287,15 @@ class TimelineEditor {
           newStart = 0;
         }
         const baseVideoDur = this.timeline.retakeVideo?.videoDurationFrames ?? totalFrames;
-        if (newStart + this._dragStartRetakeLength > baseVideoDur) {
-          newStart = baseVideoDur - this._dragStartRetakeLength;
+        // Extend support: let the window slide past the base video so you can park it entirely in
+        // the appended region (pure extend, preserving the whole clip). Same 4x ceiling.
+        const EXTEND_CEILING_C = Math.max(baseVideoDur * 4, baseVideoDur + 1);
+        if (newStart + this._dragStartRetakeLength > EXTEND_CEILING_C) {
+          newStart = EXTEND_CEILING_C - this._dragStartRetakeLength;
         }
 
         this.timeline.retakeStart = newStart;
+        this.syncWidgetsToRetakeDuration(Math.max(baseVideoDur, newStart + this._dragStartRetakeLength), false);
 
         if (this.timeline.retakeVideo && this.timeline.retakeVideo.videoEl) {
           this.timeline.retakeVideo.videoEl.currentTime = newStart / frameRate;
@@ -8838,42 +9385,96 @@ class TimelineEditor {
     let currentCursor = startFrames;
 
     if (this.retakeMode) {
-      const totalFrames = this.getVisualDurationFrames();
+      // §3.1 open-region tiling. Generalizes the old 3-window [before|retake|after]
+      // output to interleave N user image-keyframe cards inside the open region.
+      // All math is in the REAL output span [startFrames, endFrames) — NEVER the
+      // ×1.15 visual span (§1.2). With zero cards this collapses to today's output
+      // byte-for-byte (Invariant #7). Mirror of js/retake_tiling.selfcheck.mjs.
       const retakeStart = this.timeline.retakeStart ?? 0;
-      const retakeLength = this.timeline.retakeLength ?? totalFrames;
-      const retakeEnd = retakeStart + retakeLength;
+      const baseVideoDur = this.timeline.retakeVideo?.videoDurationFrames ?? (endFrames - startFrames);
+      const retakeLength = this.timeline.retakeLength ?? baseVideoDur;
       const retakePrompt = this.timeline.retakePrompt || "";
-      const retakeStrength = this.timeline.retakeStrength ?? 1.0;
+      // A2 (breaker): a strength may arrive as a non-numeric string (e.g. "0.8") from
+      // hand-edited / migrated timeline JSON. Coerce to a finite number before any
+      // .toFixed so a bad value can never crash the whole commit. Fallback to the default.
+      const numStrength = (v, dflt) => { const n = Number(v); return Number.isFinite(n) ? n : dflt; };
+      const retakeStrength = numStrength(this.timeline.retakeStrength, 1.0);
       const globalPrompt = this.globalPromptInput ? this.globalPromptInput.value : (this.node.properties?.global_prompt || "");
 
-      // 1. Preserved before
-      const pBeforeStart = startFrames;
-      const pBeforeEnd = Math.min(endFrames, retakeStart);
-      const pBeforeLen = pBeforeEnd - pBeforeStart;
-      if (pBeforeLen > 0) {
-        contiguousLengths.push(pBeforeLen);
-        contiguousPrompts.push(globalPrompt || "video");
-        imgStrengths.push("0.00");
+      // A1 FLOAT/INT SEAM (integrator): segment_lengths is contractually INTEGER pixel
+      // frames (§5.1); the backend parses them with int(float(x)) (truncation,
+      // ltx_director.py:811). retakeStart/Length and seg.start/length can deserialize or
+      // drop UNROUNDED, so we round every BOUNDARY position to an integer up front. Each
+      // window length is then a difference of integer boundaries ⇒ integer, and they
+      // telescope to round(endFrames)-round(startFrames) ⇒ sum==span holds exactly with
+      // no fractional length ever reaching Python.
+      const iStart = Math.round(startFrames);
+      const iEnd = Math.round(endFrames);
+      const openStart = Math.max(Math.round(retakeStart), iStart);
+      // openEndRaw (§1.2): the window end, unioned with the extension to baseVideoDur
+      // when the window extends past the base; then clamped to endFrames so the tiling
+      // sums to exactly the output span (Invariant #2).
+      const windowEnd = Math.round(retakeStart + retakeLength);
+      const iBaseDur = Math.round(baseVideoDur);
+      const openEndRaw = windowEnd > iBaseDur ? Math.max(windowEnd, iBaseDur) : windowEnd;
+      // HOLE1 (breaker F4): an inverted window (retake_right dragged left past retake_left)
+      // would make preserved-before and preserved-after overlap → double-count → assert FAIL.
+      // Collapse to openEnd==openStart so the two preserved spans stay adjacent.
+      const openEnd = Math.max(Math.min(openEndRaw, iEnd), openStart);
+
+      const pushWin = (L, prompt, strength) => {
+        // L2 (Invariant #9): round each window length at EMIT — defence in depth on top
+        // of the integer boundaries above, so segment_lengths is always integer pixel
+        // frames and never desyncs from Python's int(float()) parse. Idempotent here.
+        const Lr = Math.round(L); // window length
+        if (Lr > 0) {
+          contiguousLengths.push(Lr);
+          contiguousPrompts.push(prompt);
+          imgStrengths.push(strength);
+        }
+      };
+
+      // 1. preserved-before [iStart, openStart)
+      pushWin(openStart - iStart, globalPrompt || "video", "0.00");
+
+      // 2. interior of the open region — interleave clamped segment windows with fillers.
+      //    CLAMPS internally (breaker F4): never trusts the UI to have kept cards in
+      //    bounds. A stale/out-of-bounds segment is clipped or dropped, never emitted
+      //    outside [openStart, openEnd). Segment boundaries are rounded to integers too.
+      let cursor = openStart;
+      if (openEnd > openStart) {
+        const inOpen = sortedSegments.filter(
+          (sg) => (sg.type === undefined || sg.type === "image" || sg.type === "video")
+        );
+        for (const sg of inOpen) {
+          let s = Math.min(Math.max(Math.round(sg.start), openStart), openEnd);
+          const e = Math.min(Math.max(Math.round(sg.start + sg.length), openStart), openEnd);
+          if (e <= s) continue;             // no overlap with the open span → drop (F4)
+          if (s < cursor) s = cursor;       // overlap with a prior card → left-trim
+          if (e <= s) continue;             // fully swallowed by the prior card
+          if (s > cursor) pushWin(s - cursor, retakePrompt || "video", retakeStrength.toFixed(2)); // filler gap
+          // D5: the segment window carries the card's per-beat guideStrength (coerced, A2).
+          const segStrength = numStrength(sg.guideStrength, 1.0);
+          pushWin(e - s, sg.prompt || retakePrompt || "video", segStrength.toFixed(2)); // seg window
+          cursor = Math.max(cursor, e);
+        }
+        if (cursor < openEnd) {
+          // trailing filler — also covers the extension tail when no card sits in it.
+          pushWin(openEnd - cursor, retakePrompt || "video", retakeStrength.toFixed(2));
+        }
       }
 
-      // 2. Retake region
-      const rStart = Math.max(startFrames, retakeStart);
-      const rEnd = Math.min(endFrames, retakeEnd);
-      const rLen = rEnd - rStart;
-      if (rLen > 0) {
-        contiguousLengths.push(rLen);
-        contiguousPrompts.push(retakePrompt || "video");
-        imgStrengths.push(retakeStrength.toFixed(2));
-      }
+      // 3. preserved-after [openEnd, iEnd)
+      pushWin(iEnd - openEnd, globalPrompt || "video", "0.00");
 
-      // 3. Preserved after
-      const pAfterStart = Math.max(startFrames, retakeEnd);
-      const pAfterEnd = endFrames;
-      const pAfterLen = pAfterEnd - pAfterStart;
-      if (pAfterLen > 0) {
-        contiguousLengths.push(pAfterLen);
-        contiguousPrompts.push(globalPrompt || "video");
-        imgStrengths.push("0.00");
+      // HARD GUARD (Invariant #2): the tiling MUST sum to the full (integer) output span,
+      // or the relay windows stop aligning with the freeze mask. Fail loud, never corrupt
+      // silently. Compared against the rounded span the windows telescope to.
+      const tileSum = contiguousLengths.reduce((a, L) => a + L, 0);
+      const outSpan = iEnd - iStart;
+      if (tileSum !== outSpan) {
+        console.error(`[LTXDirector] retake tiling sum ${tileSum} != output span ${outSpan} — relay/mask alignment broken`, { contiguousLengths });
+        throw new Error(`retake tiling sum ${tileSum} != output span ${outSpan}`);
       }
     } else {
       // Build segment lengths clipped at the duration cutoff.
@@ -9188,7 +9789,7 @@ class TimelineEditor {
   promptAddMotionInGap(frameStart, frameEnd) {
     const fi = document.createElement("input");
     fi.type = "file";
-    fi.accept = "video/*,image/*";
+    fi.accept = "video/*";
     fi.addEventListener("change", (ev) => {
       if (ev.target.files?.[0]) this.handleMotionUpload([ev.target.files[0]], frameStart);
     });

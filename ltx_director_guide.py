@@ -295,6 +295,111 @@ def _load_motion_video_frames(video_file, trim_start_frames, length_frames, dire
 
 # --- Main Class ---
 
+def _insert_image_guides(
+    positive, negative, latent_image, noise_mask,
+    images, insert_frames, strengths,
+    vae, scale_factors, latent_length, latent_width, latent_height,
+    upscale_method, is_lora_active, image_attention_strength,
+    enforce_open_region=False,
+):
+    """Append each image keyframe guide onto the latent tail (DESIGN §4, §5.2).
+
+    Extracted verbatim from the inline normal-path loop so the retake branch can
+    reuse it without duplication. Each guide is RoPE-placed at its target frame via
+    LTXVAddGuide.get_latent_index (ceil-div + 8n+1 snap) and concatenated onto the
+    tail by append_keyframe — the freeze mask [0:latent_length] is never written
+    (invariant #6). A strength<=0 guide (e.g. the strength-0 dummy) is skipped, so a
+    zero-beat retake is a strict no-op (invariant #7).
+
+    enforce_open_region (retake branch only): backend defense for the §4.1 invariant.
+    The upstream open-region filter (ltx_director.py) is gated on tdata.retakeMode,
+    but THIS node's retake branch fires on `retake_mode input OR tdata.retakeMode` — so
+    on a forced-retake + stale-geometry config the two predicates diverge and a frozen-
+    base segment can reach here unfiltered (breaker Task #8 bug). When True, skip+warn any
+    guide whose RoPE target frame is frozen (noise_mask[:,:,latent_idx].max() <= 1e-6,
+    inside [0:L]) — that mask value still governs whether the preserved frame regenerates,
+    so it is the right quantity to test (DESIGN AMENDMENT v1.0.1, consistent with §4.2's
+    append-tail model; this reads the freeze region, it does not re-introduce the deleted
+    "noise_mask>0 at guide index" write). Default False ⇒ the normal path is byte-identical,
+    even for a partially masked input latent (preserves invariant #7).
+    """
+    for idx, img_tensor in enumerate(images):
+        f_idx = insert_frames[idx] if idx < len(insert_frames) else 0
+        strength = float(strengths[idx] if idx < len(strengths) else 1.0)
+        if strength <= 0.0:
+            continue
+
+        B_img, H_img, W_img, C_img = img_tensor.shape
+        target_pix_w = int(latent_width * 32)
+        target_pix_h = int(latent_height * 32)
+        if target_pix_w != W_img or target_pix_h != H_img:
+            img_nchw = img_tensor.permute(0, 3, 1, 2)
+            img_resized = comfy.utils.common_upscale(img_nchw, target_pix_w, target_pix_h, upscale_method, "disabled")
+            img_tensor = img_resized.permute(0, 2, 3, 1)
+
+        image_pixels, guide_latent = nodes_lt.LTXVAddGuide.encode(vae, latent_width, latent_height, img_tensor, scale_factors)
+        frame_idx, latent_idx = nodes_lt.LTXVAddGuide.get_latent_index(positive, latent_length, len(image_pixels), int(f_idx), scale_factors)
+
+        if latent_idx >= latent_length:
+            # A beat the open-region filter ACCEPTS at the window's right edge can ceil
+            # to latent_idx == latent_length and be dropped here (breaker MINOR #2): the
+            # filter works in pixel space [openStart, openEnd] inclusive of the right
+            # edge, but a card whose ceil latent index is the last frame has no latent
+            # cell to occupy. In retake the timeline doesn't grow (§1.11), so a right-edge
+            # card genuinely lands here — warn instead of silently emitting no guide.
+            if enforce_open_region:
+                log.warning(
+                    "[LTXDirectorGuide] Image guide at frame %s dropped: its latent index "
+                    "%s is past the last latent frame (%s). A beat on the window's extreme "
+                    "right edge has no latent cell to steer; move it ~%s+ px left.",
+                    int(f_idx), int(latent_idx), int(latent_length), int(scale_factors[0]),
+                )
+            continue
+
+        # Frozen-frame guard (§4.1 backend defense). The freeze mask at the guide's
+        # RoPE target frame decides whether that frame is preserved; if it is ~0,
+        # inserting here would contaminate a frozen base frame. Skip+warn rather than
+        # corrupt. Active only when enforce_open_region (retake branch); the normal
+        # path leaves this off so its behavior is unchanged.
+        if enforce_open_region:
+            # The in-range bound is redundant here (latent_idx >= 0 from get_latent_index's
+            # ceil; < latent_length from the skip above; noise_mask.shape[2] == latent_length
+            # pre-append) — it survives a future guard reorder. But it must NEVER be the
+            # reason a guide skips: an out-of-range index is an upstream bug, not a routine
+            # frozen-frame skip, so surface it LOUDER and still skip (can't safely index).
+            if not (0 <= latent_idx < noise_mask.shape[2]):
+                log.error(
+                    "[LTXDirectorGuide] Image guide latent index %s out of mask range "
+                    "[0, %s) — unexpected; skipping. This indicates an upstream index bug, "
+                    "not a frozen-frame skip.", int(latent_idx), int(noise_mask.shape[2]),
+                )
+                continue
+            if float(noise_mask[:, :, latent_idx].max().item()) <= 1e-6:
+                log.warning(
+                    "[LTXDirectorGuide] Skipping image guide at frame %s (latent %s): "
+                    "target frame is frozen (noise_mask==0). A segment outside the retake "
+                    "open region reached the guide insert — likely forced retake_mode with "
+                    "stale timeline geometry.", int(f_idx), int(latent_idx),
+                )
+                continue
+
+        max_frames = latent_length - latent_idx
+        if guide_latent.shape[2] > max_frames:
+            guide_latent = guide_latent[:, :, :max_frames]
+
+        tokens_added = guide_latent.shape[2] * guide_latent.shape[3] * guide_latent.shape[4]
+        guide_orig_shape = list(guide_latent.shape[2:])
+
+        positive, negative, latent_image, noise_mask = nodes_lt.LTXVAddGuide.append_keyframe(
+            positive, negative, frame_idx, latent_image, noise_mask, guide_latent, strength, scale_factors
+        )
+        if is_lora_active:
+            positive = _append_guide_attention_entry(positive, tokens_added, guide_orig_shape, attention_strength=image_attention_strength)
+            negative = _append_guide_attention_entry(negative, tokens_added, guide_orig_shape, attention_strength=image_attention_strength)
+
+    return positive, negative, latent_image, noise_mask
+
+
 class LTXDirectorGuide:
     @classmethod
     def INPUT_TYPES(cls):
@@ -422,6 +527,13 @@ class LTXDirectorGuide:
             if not video_file and not retake_vid_info and len(segments) > 0:
                 video_file = segments[0].get("videoFile", "")
 
+            # Extend-beyond-source: load the base at its NATIVE length (capped to the canvas)
+            # instead of stretching it to fill. If the canvas (latent_length) is longer than the
+            # base video, the latent frames past the base become a regenerated extension tail.
+            base_native_frames = int(retake_vid_info.get("videoDurationFrames", 0)) if isinstance(retake_vid_info, dict) else 0
+            load_len = ltxv_length if base_native_frames <= 0 else min(ltxv_length, base_native_frames)
+            base_latent_frames = latent_length  # updated after encode; default = full coverage (no extension)
+
             if need_base_video:
                 if not video_file:
                     if retake_vid_info and not retake_vid_info.get("imageFile"):
@@ -437,9 +549,9 @@ class LTXDirectorGuide:
 
             if video_file and need_base_video:
                 try:
-                    print(f"[LTXDirectorGuide] Loading and encoding base video file: {video_file} starting at frame {start_frame} for length {ltxv_length} at resolution {target_width}x{target_height}")
+                    print(f"[LTXDirectorGuide] Loading and encoding base video file: {video_file} starting at frame {start_frame} for length {load_len} (canvas {ltxv_length}) at resolution {target_width}x{target_height}")
                     video_frames = _load_motion_video_frames(
-                        video_file, trim_start_frames=start_frame, length_frames=ltxv_length, director_fps=director_fps, resample_mode="nearest"
+                        video_file, trim_start_frames=start_frame, length_frames=load_len, director_fps=director_fps, resample_mode="nearest"
                     )
 
                     # Retake base video must match the exact target latent shape.
@@ -464,6 +576,7 @@ class LTXDirectorGuide:
                     
                     # Copy to latent_image
                     paste_len = min(base_latent.shape[2], latent_length)
+                    base_latent_frames = paste_len  # frames past this are the regenerated extension
                     if is_empty_latent:
                         # Stage 1: Overwrite entire latent with base video VAE encode
                         latent_image[:, :, :paste_len] = base_latent[:, :, :paste_len]
@@ -487,7 +600,69 @@ class LTXDirectorGuide:
             if l_end > l_start:
                 noise_mask[:, :, l_start:l_end] = retake_strength
 
+            # Extension tail: frames past the base video have no source to preserve, so regenerate
+            # them (LTX continues from the frozen base frames) instead of freezing them to black.
+            # Only on the generation pass (empty latent); a Stage-2 refine keeps the Stage-1 tail.
+            if is_empty_latent and base_latent_frames < latent_length:
+                noise_mask[:, :, base_latent_frames:] = 1.0
+                print(f"[LTXDirectorGuide] Extend: regenerating tail frames {base_latent_frames}..{latent_length} past the base video.")
+
             print(f"[LTXDirectorGuide] noise_mask slice: {noise_mask[0, 0, :, 0, 0].tolist()}")
+
+            # PRIMARY open-region PIXEL filter (DESIGN AMENDMENT v1.0.3). The §4.1 pixel
+            # filter in ltx_director.py is gated on tdata.retakeMode, so under FORCED retake
+            # (retake_mode input True, tdata.retakeMode False) it is skipped and frozen-base
+            # beats reach here. The v1.0.1 mask-guard below is only a latent-granularity NET:
+            # it reads the freeze cell at the guide's CEIL latent_idx, but the mask opens at
+            # the FLOOR boundary (l_start = retakeStart//tsf), so a frozen-base beat in the
+            # tsf-1 (~7px) band just below retakeStart ceils onto the first OPEN latent frame
+            # and the mask-guard PASSES it. Re-apply the pixel-exact open-region test here —
+            # the only site that sees BOTH the forced retake_mode input AND the geometry. A
+            # beat (insert_frame f, relative to start_frame) is open iff it lies in the retake
+            # window OR the extension tail (§4.3, kept). This closes the ~7px band AND the
+            # forced-retake divergence at pixel granularity; the mask-guard stays as the
+            # cheap secondary net (also covers future Stage-2 interior-preserve spans).
+            open_lo = max(0, retake_start - start_frame)
+            open_hi = open_lo + retake_len
+            # Extension tail exists only when the base video doesn't cover the full latent
+            # (§4.3). When base_latent_frames == latent_length there is NO extension, so the
+            # extension branch must be empty (architect ruling) — else a beat at the latent
+            # extent would falsely pass the filter (it is dropped later by the latent_idx>=L
+            # skip, but keeping the filter pixel-exact avoids relying on that).
+            has_extension = base_latent_frames < latent_length
+            ext_lo = base_latent_frames * time_scale_factor
+            f_images, f_insert_frames, f_strengths = [], [], []
+            for idx in range(len(images)):
+                f = int(insert_frames[idx]) if idx < len(insert_frames) else 0
+                in_window = open_lo <= f < open_hi
+                in_extension = has_extension and f >= ext_lo
+                if in_window or in_extension:
+                    f_images.append(images[idx])
+                    f_insert_frames.append(insert_frames[idx])
+                    f_strengths.append(strengths[idx] if idx < len(strengths) else 1.0)
+                else:
+                    log.warning(
+                        "[LTXDirectorGuide] Dropping image guide at frame %s: outside the retake "
+                        "open region [%s, %s) ∪ extension [%s, ). A beat in frozen base (or the "
+                        "tsf-1 boundary band the mask-guard misses) cannot steer a preserved "
+                        "frame.", f, open_lo, open_hi, ext_lo,
+                    )
+
+            # Insert open-region image keyframes (DESIGN §4.1). f_images is now pixel-filtered
+            # to open-region beats and carries per-beat seg.guideStrength (ltx_director.py
+            # §3.2/§4.1). The freeze mask [0:latent_length] is untouched — append_keyframe only
+            # writes the tail (invariant #6). With zero open-region beats, f_images is
+            # empty-or-the-strength-0-dummy ⇒ this is a strict no-op, byte-identical to today
+            # (invariant #7). exact_crop_frames below self-corrects for any appended tail
+            # because initial_latent_length was captured pre-insert. enforce_open_region keeps
+            # the v1.0.1 mask-guard as the secondary net.
+            positive, negative, latent_image, noise_mask = _insert_image_guides(
+                positive, negative, latent_image, noise_mask,
+                f_images, f_insert_frames, f_strengths,
+                vae, scale_factors, latent_length, latent_width, latent_height,
+                upscale_method, is_lora_active, image_attention_strength,
+                enforce_open_region=True,   # §4.1 backend defense vs predicate divergence (secondary net)
+            )
 
             # In retake mode, skip normal mode processing entirely and return immediately!
             exact_crop_frames = max(0, int(latent_image.shape[2]) - initial_latent_length)
@@ -505,39 +680,12 @@ class LTXDirectorGuide:
             print(f"[LTXDirectorGuide] Using Appended Keyframe Guidance. is_lora_active: {is_lora_active}")
 
             # A. Process Image Guides
-            for idx, img_tensor in enumerate(images):
-                f_idx = insert_frames[idx] if idx < len(insert_frames) else 0
-                strength = float(strengths[idx] if idx < len(strengths) else 1.0)
-                if strength <= 0.0:
-                    continue
-
-                B_img, H_img, W_img, C_img = img_tensor.shape
-                target_pix_w = int(latent_width * 32)
-                target_pix_h = int(latent_height * 32)
-                if target_pix_w != W_img or target_pix_h != H_img:
-                    img_nchw = img_tensor.permute(0, 3, 1, 2)
-                    img_resized = comfy.utils.common_upscale(img_nchw, target_pix_w, target_pix_h, upscale_method, "disabled")
-                    img_tensor = img_resized.permute(0, 2, 3, 1)
-
-                image_pixels, guide_latent = nodes_lt.LTXVAddGuide.encode(vae, latent_width, latent_height, img_tensor, scale_factors)
-                frame_idx, latent_idx = nodes_lt.LTXVAddGuide.get_latent_index(positive, latent_length, len(image_pixels), int(f_idx), scale_factors)
-
-                if latent_idx >= latent_length:
-                    continue
-
-                max_frames = latent_length - latent_idx
-                if guide_latent.shape[2] > max_frames:
-                    guide_latent = guide_latent[:, :, :max_frames]
-
-                tokens_added = guide_latent.shape[2] * guide_latent.shape[3] * guide_latent.shape[4]
-                guide_orig_shape = list(guide_latent.shape[2:])
-
-                positive, negative, latent_image, noise_mask = nodes_lt.LTXVAddGuide.append_keyframe(
-                    positive, negative, frame_idx, latent_image, noise_mask, guide_latent, strength, scale_factors
-                )
-                if is_lora_active:
-                    positive = _append_guide_attention_entry(positive, tokens_added, guide_orig_shape, attention_strength=image_attention_strength)
-                    negative = _append_guide_attention_entry(negative, tokens_added, guide_orig_shape, attention_strength=image_attention_strength)
+            positive, negative, latent_image, noise_mask = _insert_image_guides(
+                positive, negative, latent_image, noise_mask,
+                images, insert_frames, strengths,
+                vae, scale_factors, latent_length, latent_width, latent_height,
+                upscale_method, is_lora_active, image_attention_strength,
+            )
 
             # B. Process Motion Video Segments
             for seg in segments:

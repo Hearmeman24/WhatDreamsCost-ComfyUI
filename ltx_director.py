@@ -808,7 +808,30 @@ def _encode_relay(model, clip, latent, global_prompt, local_prompts, segment_len
 
     parsed_lengths = None
     if segment_lengths.strip():
-        pixel_lengths = [int(float(x.strip())) for x in segment_lengths.split(",") if x.strip()]
+        # AMENDMENT v1.0.2 / Invariant #9 (L3, per v1.0.3 corrected text) — cross-language
+        # seam guard. Pixel frames are INTEGERS end-to-end (§4.2.1). The JS HARD GUARD sums
+        # FLOATS and owns sum==span (where the true UN-snapped span is known). This parse
+        # must not silently truncate a fractional token — int(float("23.6"))=23 drops .6 ⇒
+        # the relay sums short ⇒ loses the §3.2 full-coverage pin ⇒ de-aligns from the freeze
+        # mask (silent conditioning corruption, no crash). PER-TOKEN integrality is the right
+        # PY check: span-free and strictly stronger than sum==span (the true span is NOT
+        # recoverable here — the latent is 8n+1-snapped, so a latent-derived span can exceed
+        # the token sum by up to tsf-1 and would false-RED correct builds). On a fractional
+        # token: log.error, then int(round()) (defensive recovery to the nearest integer
+        # frame) and CONTINUE — never crash a user mid-gen (incl. a migrated saved timeline).
+        # Unreachable once the JS rounding layers (L1/L2) land.
+        raw_lengths = [float(x.strip()) for x in segment_lengths.split(",") if x.strip()]
+        for rl in raw_lengths:
+            if abs(rl - round(rl)) > 1e-6:
+                log.error(
+                    "[PromptRelay] segment_lengths has a fractional pixel frame %r in %r — a "
+                    "fractional frame de-aligns the relay tiling from the freeze mask "
+                    "(Invariant #9). Recovering to the nearest integer frame; re-emit from the "
+                    "timeline editor (rounds at entry + emit) to silence this.",
+                    rl, segment_lengths,
+                )
+                break
+        pixel_lengths = [int(round(rl)) for rl in raw_lengths]
         parsed_lengths = _convert_to_latent_lengths(pixel_lengths, temporal_stride, latent_frames)
 
     raw_tokenizer = get_raw_tokenizer(clip)
@@ -993,6 +1016,34 @@ class LTXDirector(io.ComfyNode):
         # --- Build guide_data from image segments FIRST (to derive output dimensions) ---
         guide_data = {"images": [], "insert_frames": [], "strengths": [], "frame_rate": frame_rate}
         derived_w, derived_h = custom_width, custom_height
+
+        # Retake open-region bounds (DESIGN §1.2, §4.1). In retake mode a segment is a
+        # "beat" only if its span lies entirely within the open region (retake window ∪
+        # extension). Frozen base frames are off-limits. Pixel space is canonical (§4.2.1).
+        # endFrames = start_frame + duration_frames is the true output span; openEnd clamps
+        # to it so the §3.1 tiling sums to the full output span (invariant #2).
+        # The extension is already folded into retakeLength via syncWidgetsToRetakeDuration
+        # (D6), so retakeStart+retakeLength covers window∪extension.
+        is_retake_filter = bool(tdata.get("retakeMode", False))
+        open_start = max(int(tdata.get("retakeStart", 0)), start_frame)
+        open_end = min(
+            int(tdata.get("retakeStart", 0)) + int(tdata.get("retakeLength", 0)),
+            start_frame + duration_frames,
+        )
+        # HOLE1 (DESIGN §3.1:408): an inverted window (retake_right dragged past
+        # retake_left) must never yield open_end < open_start. Clamp to match the
+        # contract's openEnd exactly; _in_open_region then rejects every beat for a
+        # collapsed/inverted window (correct: no open region ⇒ no beats).
+        open_end = max(open_end, open_start)
+
+        def _in_open_region(s):
+            # Zero-card guard (breaker F3 / invariant #7): a normal-mode segment that
+            # merely overlaps the canvas but is NOT fully inside the open region is dropped,
+            # so 0-beat retake yields img_segs == [] ⇒ only the strength-0 dummy survives.
+            seg_s = int(s.get("start", 0))
+            seg_e = seg_s + int(s.get("length", 1))
+            return seg_s >= open_start and seg_e <= open_end
+
         try:
             img_segs = [
                 s for s in tdata.get("segments", [])
@@ -1000,6 +1051,7 @@ class LTXDirector(io.ComfyNode):
                 and (s.get("imageFile") or s.get("imageB64"))
                 and int(s.get("start", 0)) < start_frame + duration_frames
                 and int(s.get("start", 0)) + int(s.get("length", 1)) > start_frame
+                and (not is_retake_filter or _in_open_region(s))
             ]
             img_segs.sort(key=lambda s: s["start"])
 
@@ -1056,7 +1108,15 @@ class LTXDirector(io.ComfyNode):
                     insert_frame = max(0, seg_start + int(seg.get("length", 1)) - 1 - start_frame)
                 else:
                     insert_frame = max(0, seg_start - start_frame)
-                strength = strengths[idx] if idx < len(strengths) else 1.0
+                # Per-image guide strength (DESIGN §3.2, lead fix #2). In retake mode the
+                # positional guide_strength widget is WINDOW-aligned (it includes non-image
+                # filler windows), so strengths[idx] would mis-pair strength→image. Read each
+                # beat's strength from seg.guideStrength instead. Normal mode keeps the
+                # positional widget (it is already image-only there).
+                if is_retake_filter:
+                    strength = float(seg.get("guideStrength", 1.0))
+                else:
+                    strength = strengths[idx] if idx < len(strengths) else 1.0
                 guide_data["images"].append(tensor)
                 guide_data["insert_frames"].append(insert_frame)
                 guide_data["strengths"].append(float(strength))
